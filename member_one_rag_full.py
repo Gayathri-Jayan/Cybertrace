@@ -1,245 +1,334 @@
 import os
-import traceback
-from fastapi import FastAPI, HTTPException, Request
-from typing import List, Optional, Dict, Any
+import numpy as np
 import faiss
 import pickle
-import numpy as np
+import json
+from datetime import datetime
 
-# --------------------------
-# LLM Configuration
-# --------------------------
+import google.generativeai as genai
+from sentence_transformers import SentenceTransformer
+
+from fastapi import FastAPI
+from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from dotenv import load_dotenv
+
+# =======================
+# Load environment variables
+# =======================
+load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-MODEL_NAME = os.getenv("RAG_MODEL_NAME", "text-bison-001")
+if not GOOGLE_API_KEY:
+    raise ValueError("❌ GOOGLE_API_KEY not found in .env file")
 
-HAS_GOOGLE = False
-HAS_OPENAI = False
-genai = None
-openai = None
+genai.configure(api_key=GOOGLE_API_KEY)
 
-if GOOGLE_API_KEY:
-    try:
-        import google.generativeai as genai
-        genai.configure(api_key=GOOGLE_API_KEY)
-        HAS_GOOGLE = True
-        print("✅ Google Generative AI configured")
-    except Exception:
-        print("⚠️ Failed to configure Google Generative AI")
-        traceback.print_exc()
+# =======================
+# Initialize Gemini model
+# =======================
+model = genai.GenerativeModel("gemini-2.5-flash")
 
-if not HAS_GOOGLE and OPENAI_API_KEY:
-    try:
-        import openai
-        openai.api_key = OPENAI_API_KEY
-        HAS_OPENAI = True
-        print("✅ OpenAI configured")
-    except Exception:
-        print("⚠️ Failed to configure OpenAI")
-        traceback.print_exc()
+# =======================
+# Load embedding model
+# =======================
+print("🔧 Loading embedding model...")
+mpnet_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
+print("✅ Embedding model loaded")
 
-if not HAS_GOOGLE and not HAS_OPENAI:
-    print("⚠️ No LLM provider configured. Using dummy fallback.")
+def get_embedding(text: str):
+    emb = mpnet_model.encode(text, normalize_embeddings=True)
+    return np.array(emb, dtype=np.float32)
 
-# --------------------------
-# FastAPI app
-# --------------------------
-app = FastAPI(title="RAG Pipeline API")
+# =======================
+# Load FAISS PDF Store
+# =======================
+FAISS_DIR = "faiss"
+stores = {}
 
-# --------------------------
-# Embedding Models (multiple)
-# --------------------------
-EMBEDDING_MODELS = {
-    "pdf_store": "all-mpnet-base-v2",
-    "csv_store": "all-mpnet-base-v2",
-    "json_store": "all-mpnet-base-v2",
-    "url_store": "all-MiniLM-L6-v2"
+pdf_dir = os.path.join(FAISS_DIR, "pdf_store")
+pdf_index_file = os.path.join(pdf_dir, "index.faiss")
+pdf_text_file = os.path.join(pdf_dir, "id2text.pkl")
+pdf_meta_file = os.path.join(pdf_dir, "id2meta.pkl")
+
+if not (os.path.exists(pdf_index_file)
+        and os.path.exists(pdf_text_file)
+        and os.path.exists(pdf_meta_file)):
+    raise FileNotFoundError("❌ PDF FAISS store files missing")
+
+pdf_index = faiss.read_index(pdf_index_file)
+
+with open(pdf_text_file, "rb") as f:
+    pdf_id2text = pickle.load(f)
+
+with open(pdf_meta_file, "rb") as f:
+    pdf_id2meta = pickle.load(f)
+
+stores["pdf_store"] = {
+    "index": pdf_index,
+    "id2text": pdf_id2text,
+    "id2meta": pdf_id2meta
 }
 
-_embedding_models: Dict[str, Any] = {}
+print("✅ PDF store loaded successfully")
 
-def get_embedding_model(store_name: str):
-    if store_name not in _embedding_models:
-        try:
-            from sentence_transformers import SentenceTransformer
-            model_name = EMBEDDING_MODELS.get(store_name)
-            _embedding_models[store_name] = SentenceTransformer(model_name)
-            print(f"✅ Loaded embedding model for {store_name}: {model_name}")
-        except Exception:
-            print(f"⚠️ Failed to load embedding model for {store_name}")
-            traceback.print_exc()
-            raise
-    return _embedding_models[store_name]
+# =======================
+# Load CSV Store
+# =======================
+csv_dir = os.path.join(FAISS_DIR, "csv_store")
+csv_index_file = os.path.join(csv_dir, "index.faiss")
+csv_pkl_file = os.path.join(csv_dir, "index.pkl")
 
-def embed_query(query: str, store_name: str):
-    model = get_embedding_model(store_name)
-    emb = model.encode([query], normalize_embeddings=True)
-    return np.array(emb[0], dtype="float32")
+if os.path.exists(csv_index_file) and os.path.exists(csv_pkl_file):
+    csv_index = faiss.read_index(csv_index_file)
+    with open(csv_pkl_file, "rb") as f:
+        csv_docstore, csv_id_map = pickle.load(f)
 
-# --------------------------
-# FAISS Index Loader
-# --------------------------
-FAISS_BASE_DIR = "faiss"
-INDEX_NAMES = ["pdf_store", "csv_store", "json_store", "url_store"]
-faiss_indexes: Dict[str, Dict[str, Any]] = {}
+    stores["csv_store"] = {
+        "index": csv_index,
+        "docstore": csv_docstore,
+        "id_map": csv_id_map
+    }
+    print("✅ Loaded CSV store")
 
-def load_faiss_index(index_name: str):
+
+
+# =======================
+# Load URL Store
+# =======================
+url_dir = os.path.join(FAISS_DIR, "url_store")
+url_index_file = os.path.join(url_dir, "cyber_vectors.index")
+url_meta_file = os.path.join(url_dir, "cyber_metadata.json")
+
+if os.path.exists(url_index_file) and os.path.exists(url_meta_file):
+    url_index = faiss.read_index(url_index_file)
+    with open(url_meta_file, "r", encoding="utf-8") as f:
+        url_metadata = json.load(f)
+
+    stores["url_store"] = {
+        "index": url_index,
+        "metadata": url_metadata
+    }
+    print("✅ Loaded URL store")
+
+
+# =======================
+# FastAPI Setup
+# =======================
+app = FastAPI(title="CyberTrace – RAG Backend (PDF Only)")
+
+class QueryRequest(BaseModel):
+    query: str
+    top_k: int = 3
+
+# =======================
+# Time Utilities
+# =======================
+def parse_timestamp(ts):
     try:
-        index_dir = os.path.join(FAISS_BASE_DIR, index_name)
-        faiss_file = os.path.join(index_dir, "index.faiss")
-        possible_meta = [
-            os.path.join(index_dir, "index.pkl"),
-            os.path.join(index_dir, "metadata.pkl"),
-        ]
-        if not os.path.exists(faiss_file):
-            print(f"⚠️ Skipping {index_name}: missing index file")
-            return None, None
+        return datetime.fromisoformat(ts).timestamp()
+    except:
+        return 0.0
 
-        index = faiss.read_index(faiss_file)
+def time_aware_rerank(docs, alpha=0.7):
+    """
+    alpha = semantic importance
+    (1-alpha) = recency importance
+    """
+    if not docs:
+        return docs
 
-        meta = None
-        for p in possible_meta:
-            if os.path.exists(p):
-                try:
-                    with open(p, "rb") as f:
-                        meta = pickle.load(f)
-                except ModuleNotFoundError:
-                    print(f"⚠️ Module missing when loading {p}. Skipping metadata.")
-                break
+    max_time = max(parse_timestamp(d.get("timestamp", "")) for d in docs) or 1.0
 
-        print(f"✅ Loaded {index_name}: ntotal={index.ntotal}, dim={index.d}")
-        return index, meta
-    except Exception:
-        print(f"⚠️ Failed to load {index_name}")
-        traceback.print_exc()
-        return None, None
+    for d in docs:
+        semantic_score = d["score"]
+        recency_score = parse_timestamp(d.get("timestamp", "")) / max_time
+        d["final_score"] = alpha * semantic_score + (1 - alpha) * recency_score
 
-for name in INDEX_NAMES:
-    idx, meta = load_faiss_index(name)
-    if idx:
-        faiss_indexes[name] = {"index": idx, "metadata": meta}
+    docs.sort(key=lambda x: x["final_score"], reverse=True)
+    return docs
 
-# --------------------------
-# FAISS Search
-# --------------------------
-def search_faiss(query: str, store_name: str, k: int = 5):
-    results = []
-    if store_name not in faiss_indexes:
-        return results
+# =======================
+# Retrieval Function (PDF + Time-Aware)
+# =======================
+def retrieve_from_all_stores(query_text, top_k=3):
+    all_docs = []
 
-    store = faiss_indexes[store_name]
-    index = store.get("index")
-    metadata = store.get("metadata")
+    query_vector = get_embedding(query_text)
+    query_vector = np.array([query_vector], dtype=np.float32)
+    faiss.normalize_L2(query_vector)
 
-    q_emb = embed_query(query, store_name)
-    if q_emb.shape[0] != index.d:
-        print(f"⚠️ Dimension mismatch for {store_name}: query={q_emb.shape[0]}, index={index.d}")
-        return results
+    # ---------- PDF ----------
 
+    if "pdf_store" in stores:
+        s = stores["pdf_store"]
+        if s["index"].d == query_vector.shape[1]:
+            D, I = s["index"].search(query_vector, top_k * 3)
+
+            for idx, score in zip(I[0], D[0]):
+                if idx < 0:
+                    continue
+                meta = s["id2meta"].get(int(idx), {})
+                all_docs.append({
+                    "source": "pdf",
+                    "file": meta.get("source_file"),
+                    "page": meta.get("page"),
+                    "timestamp": meta.get("timestamp", ""),
+                    "content": s["id2text"].get(int(idx), ""),
+                    "score": float(score)
+                })
+
+    # ---------- CSV ----------
+    if "csv_store" in stores:
+        s = stores["csv_store"]
+        if s["index"].d == query_vector.shape[1]:
+            D, I = s["index"].search(query_vector, top_k * 2)
+
+            for idx, score in zip(I[0], D[0]):
+                if idx < 0:
+                    continue
+
+                doc_id = s["id_map"].get(idx)
+                if not doc_id:
+                    continue
+
+                doc = s["docstore"]._dict.get(doc_id)
+                if not doc:
+                    continue
+
+                all_docs.append({
+                    "source": "csv",
+                    "file": doc.metadata.get("source"),
+                    "timestamp": doc.metadata.get("timestamp", ""),
+                    "content": doc.page_content,
+                    "score": float(score)
+                })
+        else:
+            print("⚠️ Skipping CSV store due to embedding dimension mismatch")
+
+
+
+    # ---------- URL ----------
+    if "url_store" in stores:
+        s = stores["url_store"]
+        if s["index"].d == query_vector.shape[1]:
+            D, I = s["index"].search(query_vector, top_k * 2)
+
+            for idx, score in zip(I[0], D[0]):
+                if idx < 0:
+                    continue
+
+                # metadata is a LIST, not dict
+                if idx >= len(s["metadata"]):
+                    continue
+
+                meta = s["metadata"][idx]
+
+                all_docs.append({
+                    "source": "url",
+                    "file": meta.get("url"),
+                    "timestamp": meta.get("published_date", ""),
+                    "content": meta.get("text", ""),
+                    "score": float(score)
+                })
+        else:
+            print("⚠️ Skipping URL store due to embedding dimension mismatch")
+
+
+
+    # 🔥 Time-aware re-ranking
+    reranked = time_aware_rerank(all_docs)
+
+    return reranked[:top_k]
+
+
+# =======================
+# Prompt Construction (RAG)
+# =======================
+def build_prompt(docs, query):
+    context_block = ""
+
+    for i, d in enumerate(docs):
+        source_name = d.get("source_file") or d.get("file") or "unknown"
+        timestamp = d.get("timestamp", "N/A")
+
+        context_block += f"""
+[Context {i+1}]
+Source: {source_name}
+Timestamp: {timestamp}
+Content:
+{d.get("content", "")}
+"""
+
+    return f"""
+You are a cybersecurity expert assistant.
+Answer ONLY using the provided contexts.
+If the answer is not present, say "Information not available in retrieved data."
+
+{context_block}
+
+Question:
+{query}
+
+Answer:
+"""
+
+
+# =======================
+# LLM Response Generator
+# =======================
+def generate_answer(prompt):
     try:
-        D, I = index.search(q_emb.reshape(1, -1), k)
-        for dist, idx in zip(D[0], I[0]):
-            if idx == -1:
-                continue
-            entry_meta = metadata[idx] if metadata else None
-            results.append({
-                "store": store_name,
-                "doc_id": int(idx),
-                "metadata": entry_meta,
-                "distance": float(dist)
-            })
-    except Exception:
-        print(f"⚠️ Error searching {store_name}")
-        traceback.print_exc()
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        print("⚠️ LLM Error:", e)
+        return "(LLM generation failed)"
 
-    return results
-
-def retrieve_all(query: str, top_k: int = 5):
-    all_results = []
-    for store_name in faiss_indexes.keys():
-        res = search_faiss(query, store_name, k=top_k)
-        all_results.extend(res)
-    all_results.sort(key=lambda x: x.get("distance", float("inf")))
-    return all_results[:top_k]
-
-def assemble_context(retrieved: List[dict], max_chars: int = 4000) -> str:
-    pieces = []
-    total = 0
-    for r in retrieved:
-        text = r.get("metadata")
-        if isinstance(text, (dict, list)):
-            text = str(text)
-        if not text:
-            continue
-        if total + len(text) > max_chars:
-            pieces.append(text[:max_chars - total])
-            break
-        pieces.append(text)
-        total += len(text)
-    return "\n---\n".join(pieces)
-
-# --------------------------
-# Generate Answer
-# --------------------------
-def generate_answer(query: str, retrieved: List[dict], provider: Optional[str] = None) -> Dict[str, Any]:
-    context = assemble_context(retrieved)
-    prompt = f"Use the context to answer the question.\nContext:\n{context}\n\nQuestion: {query}\nAnswer:"
-
-    if provider == "google" or (provider is None and HAS_GOOGLE):
-        try:
-            resp = genai.generate_text(model=MODEL_NAME, prompt=prompt)
-            text = getattr(resp, "text", str(resp))
-            return {"answer": text, "model": f"google:{MODEL_NAME}", "raw": resp}
-        except Exception:
-            traceback.print_exc()
-
-    if provider == "openai" or (provider is None and HAS_OPENAI):
-        try:
-            completion = openai.ChatCompletion.create(
-                model=os.getenv("OPENAI_CHAT_MODEL", "gpt-3.5-turbo"),
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=512,
-                temperature=0.0,
-            )
-            text = completion["choices"][0]["message"]["content"]
-            return {"answer": text, "model": f"openai:{os.getenv('OPENAI_CHAT_MODEL','gpt-3.5-turbo')}", "raw": completion}
-        except Exception:
-            traceback.print_exc()
-
-    # Fallback
-    summary = " \n ".join([str(r.get("metadata")) for r in retrieved[:3]])
-    fallback = f"(No LLM configured) Retrieved context summary:\n{summary}\n\nQuestion: {query}\nAnswer: I don't have an LLM configured."
-    return {"answer": fallback, "model": "none", "raw": None}
-
-# --------------------------
-# FastAPI Endpoints
-# --------------------------
-@app.get("/")
-async def root():
-    return {"message": "RAG Pipeline API is running"}
-
+# =======================
+# Query Endpoint
+# =======================
 @app.post("/query")
-async def query_endpoint(request: Request):
-    try:
-        data = await request.json()
-        query = data.get("query", "")
-        if not query:
-            raise HTTPException(status_code=400, detail="Query is required")
-        top_k = int(data.get("top_k", 5))
-        provider = data.get("provider")
+async def query_endpoint(request: QueryRequest):
+    print(f"🔍 Query received: {request.query}")
+    retrieved_docs = retrieve_from_all_stores(
+    request.query,
+    top_k=request.top_k
+    )
 
-        retrieved = retrieve_all(query, top_k)
-        out = generate_answer(query, retrieved, provider=provider)
 
-        return {
-            "query": query,
-            "answer": out.get("answer"),
-            "model": out.get("model"),
-            "retrieved": retrieved
+    if not retrieved_docs:
+        return JSONResponse({
+            "query": request.query,
+            "answer": "(No relevant context found)",
+            "contexts": []
+        })
+
+    prompt = build_prompt(retrieved_docs, request.query)
+    answer = generate_answer(prompt)
+
+    return JSONResponse({
+    "query": request.query,
+    "answer": answer,
+    "contexts": [
+        {
+            "source": d.get("source", "unknown"),
+            "file": d.get("source_file") or d.get("file") or "unknown",
+            "page": d.get("page"),
+            "timestamp": d.get("timestamp", "N/A"),
+            "semantic_score": d.get("score"),
+            "final_score": d.get("final_score"),
+            "snippet": d.get("content", "")[:300]
         }
+        for d in retrieved_docs
+    ]
+})
 
-    except HTTPException as e:
-        raise e
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Internal server error")
+
+# =======================
+# Root Endpoint
+# =======================
+@app.get("/")
+def root():
+    return {
+        "message": "🚀 CyberTrace RAG Backend (PDF + Time-Aware Retrieval) is running"
+    }
