@@ -5,4 +5,5 @@ faiss-cpu
 numpy
 openai
 sentence-transformers
-google-generative-ai
+google-generativeai
+python-dotenv
